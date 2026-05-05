@@ -134,6 +134,11 @@ fn mint_leaf(ca: &EphemeralCa, hostname: &str) -> Result<Arc<CertifiedKey>> {
 
     let mut params = CertificateParams::default();
     params.subject_alt_names = vec![dns_san(hostname)?];
+    // RFC 5280 §4.2.1.1 requires Authority Key Identifier on certs issued
+    // by a CA; rcgen defaults the flag to false. Stricter verifiers
+    // (OpenSSL 3.6+, BoringSSL) reject leaves without AKI with
+    // "Missing Authority Key Identifier".
+    params.use_authority_key_identifier_extension = true;
 
     let now = SystemTime::now();
     params.not_before = system_time_to_offset(now)?;
@@ -215,6 +220,22 @@ mod tests {
         // (SEQUENCE). A trivial sanity check that we produced something
         // shaped like a certificate.
         assert_eq!(ck.cert[0].as_ref()[0], 0x30);
+    }
+
+    #[test]
+    fn minted_leaf_carries_authority_key_identifier() {
+        // OpenSSL 3.6+ (Python 3.14) rejects issued certs without AKI with
+        // "Missing Authority Key Identifier". rcgen defaults the flag off,
+        // so we set it explicitly in `mint_leaf`. Verify the extension OID
+        // 2.5.29.35 (DER bytes 06 03 55 1d 23) is present in the leaf DER.
+        let cache = fresh_cache();
+        let ck = cache.get_or_mint("api.example.com").unwrap();
+        let der = ck.cert[0].as_ref();
+        let aki_oid = [0x06, 0x03, 0x55, 0x1d, 0x23];
+        assert!(
+            der.windows(aki_oid.len()).any(|w| w == aki_oid),
+            "minted leaf must include Authority Key Identifier (OID 2.5.29.35)"
+        );
     }
 
     #[test]
