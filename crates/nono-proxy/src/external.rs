@@ -192,7 +192,19 @@ pub async fn handle_external_proxy(
     let check = filter.check_host(&host, port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
-        audit::log_denied(audit_log, audit::ProxyMode::External, &host, port, &reason);
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::External,
+            &audit::EventContext {
+                auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            &reason,
+        );
         send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
         return Err(ProxyError::HostDenied { host, reason });
     }
@@ -211,35 +223,63 @@ pub async fn handle_external_proxy(
 
     // Connect to enterprise proxy and CONNECT through it to the upstream.
     // Auth is gated above; pass None until configurable proxy auth lands.
-    let mut proxy_stream =
-        match connect_via_proxy(&external_config.address, &host, port, None).await {
-            Ok(s) => s,
-            Err(ProxyError::ExternalProxy(msg)) if msg.contains("rejected CONNECT") => {
-                // Enterprise proxy returned non-200. Surface the same status
-                // back to the agent so it can react sensibly (e.g. blocked
-                // by corporate policy).
-                audit::log_denied(audit_log, audit::ProxyMode::External, &host, port, &msg);
-                send_response(stream, 502, "Bad Gateway").await?;
-                return Err(ProxyError::ExternalProxy(msg));
-            }
-            Err(e) => {
-                audit::log_denied(
-                    audit_log,
-                    audit::ProxyMode::External,
-                    &host,
-                    port,
-                    &e.to_string(),
-                );
-                send_response(stream, 502, "Bad Gateway").await?;
-                return Err(e);
-            }
-        };
+    let mut proxy_stream = match connect_via_proxy(&external_config.address, &host, port, None)
+        .await
+    {
+        Ok(s) => s,
+        Err(ProxyError::ExternalProxy(msg)) if msg.contains("rejected CONNECT") => {
+            // Enterprise proxy returned non-200. Surface the same status
+            // back to the agent so it can react sensibly (e.g. blocked
+            // by corporate policy).
+            audit::log_denied(
+                audit_log,
+                audit::ProxyMode::External,
+                &audit::EventContext {
+                    auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::ExternalProxyRejected,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                &host,
+                port,
+                &msg,
+            );
+            send_response(stream, 502, "Bad Gateway").await?;
+            return Err(ProxyError::ExternalProxy(msg));
+        }
+        Err(e) => {
+            audit::log_denied(
+                audit_log,
+                audit::ProxyMode::External,
+                &audit::EventContext {
+                    auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                &host,
+                port,
+                &e.to_string(),
+            );
+            send_response(stream, 502, "Bad Gateway").await?;
+            return Err(e);
+        }
+    };
 
     // Send 200 to agent
     send_response(stream, 200, "Connection Established").await?;
     audit::log_allowed(
         audit_log,
         audit::ProxyMode::External,
+        &audit::EventContext {
+            auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            ..audit::EventContext::default()
+        },
         &host,
         port,
         "CONNECT",

@@ -72,6 +72,7 @@ pub struct UpstreamSpec<'a> {
 pub struct AuditCtx<'a> {
     pub log: Option<&'a audit::SharedAuditLog>,
     pub mode: audit::ProxyMode,
+    pub event_ctx: audit::EventContext<'a>,
     /// Logical target string (route prefix for reverse, hostname for intercept).
     pub target: &'a str,
     pub method: &'a str,
@@ -111,6 +112,7 @@ where
     audit::log_l7_request(
         audit.log,
         audit.mode,
+        &audit.event_ctx,
         audit.target,
         audit.method,
         audit.path,

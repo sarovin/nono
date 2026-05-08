@@ -4,7 +4,10 @@
 //! Sensitive data (authorization headers, tokens, request bodies)
 //! is never included in audit logs.
 
-use nono::undo::{NetworkAuditDecision, NetworkAuditEvent, NetworkAuditMode};
+use nono::undo::{
+    NetworkAuditAuthMechanism, NetworkAuditAuthOutcome, NetworkAuditDecision,
+    NetworkAuditDenialCategory, NetworkAuditEvent, NetworkAuditInjectionMode, NetworkAuditMode,
+};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -27,6 +30,17 @@ pub enum ProxyMode {
     Reverse,
     /// External proxy passthrough (enterprise)
     External,
+}
+
+/// Optional structured audit context attached to a proxy event.
+#[derive(Debug, Clone, Default)]
+pub struct EventContext<'a> {
+    pub route_id: Option<&'a str>,
+    pub auth_mechanism: Option<NetworkAuditAuthMechanism>,
+    pub auth_outcome: Option<NetworkAuditAuthOutcome>,
+    pub managed_credential_active: Option<bool>,
+    pub injection_mode: Option<NetworkAuditInjectionMode>,
+    pub denial_category: Option<NetworkAuditDenialCategory>,
 }
 
 impl std::fmt::Display for ProxyMode {
@@ -120,6 +134,7 @@ fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
 pub fn log_allowed(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
+    ctx: &EventContext<'_>,
     host: &str,
     port: u16,
     method: &str,
@@ -140,6 +155,12 @@ pub fn log_allowed(
             timestamp_unix_ms: now_unix_millis(),
             mode: map_mode(mode),
             decision: NetworkAuditDecision::Allow,
+            route_id: ctx.route_id.map(str::to_string),
+            auth_mechanism: ctx.auth_mechanism.clone(),
+            auth_outcome: ctx.auth_outcome.clone(),
+            managed_credential_active: ctx.managed_credential_active,
+            injection_mode: ctx.injection_mode.clone(),
+            denial_category: None,
             target: host.to_string(),
             port: Some(port),
             method: Some(method.to_string()),
@@ -154,6 +175,7 @@ pub fn log_allowed(
 pub fn log_denied(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
+    ctx: &EventContext<'_>,
     host: &str,
     port: u16,
     reason: &str,
@@ -174,6 +196,12 @@ pub fn log_denied(
             timestamp_unix_ms: now_unix_millis(),
             mode: map_mode(mode),
             decision: NetworkAuditDecision::Deny,
+            route_id: ctx.route_id.map(str::to_string),
+            auth_mechanism: ctx.auth_mechanism.clone(),
+            auth_outcome: ctx.auth_outcome.clone(),
+            managed_credential_active: ctx.managed_credential_active,
+            injection_mode: ctx.injection_mode.clone(),
+            denial_category: ctx.denial_category.clone(),
             target: host.to_string(),
             port: Some(port),
             method: None,
@@ -192,6 +220,7 @@ pub fn log_denied(
 pub fn log_l7_request(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
+    ctx: &EventContext<'_>,
     target: &str,
     method: &str,
     path: &str,
@@ -213,6 +242,12 @@ pub fn log_l7_request(
             timestamp_unix_ms: now_unix_millis(),
             mode: map_mode(mode),
             decision: NetworkAuditDecision::Allow,
+            route_id: ctx.route_id.map(str::to_string),
+            auth_mechanism: ctx.auth_mechanism.clone(),
+            auth_outcome: ctx.auth_outcome.clone(),
+            managed_credential_active: ctx.managed_credential_active,
+            injection_mode: ctx.injection_mode.clone(),
+            denial_category: None,
             target: target.to_string(),
             port: None,
             method: Some(method.to_string()),
@@ -233,7 +268,18 @@ pub fn log_reverse_proxy(
     path: &str,
     status: u16,
 ) {
-    log_l7_request(audit_log, ProxyMode::Reverse, service, method, path, status);
+    log_l7_request(
+        audit_log,
+        ProxyMode::Reverse,
+        &EventContext {
+            route_id: Some(service),
+            ..EventContext::default()
+        },
+        service,
+        method,
+        path,
+        status,
+    );
 }
 
 #[cfg(test)]
@@ -248,6 +294,7 @@ mod tests {
         log_allowed(
             Some(&log),
             ProxyMode::Connect,
+            &EventContext::default(),
             "api.openai.com",
             443,
             "CONNECT",
@@ -258,6 +305,8 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.mode, NetworkAuditMode::Connect);
         assert_eq!(event.decision, NetworkAuditDecision::Allow);
+        assert_eq!(event.route_id, None);
+        assert_eq!(event.auth_mechanism, None);
         assert_eq!(event.target, "api.openai.com");
         assert_eq!(event.port, Some(443));
         assert_eq!(event.method.as_deref(), Some("CONNECT"));
@@ -271,6 +320,7 @@ mod tests {
         log_denied(
             Some(&log),
             ProxyMode::External,
+            &EventContext::default(),
             "169.254.169.254",
             80,
             "blocked by metadata deny list",
@@ -281,6 +331,8 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.mode, NetworkAuditMode::External);
         assert_eq!(event.decision, NetworkAuditDecision::Deny);
+        assert_eq!(event.route_id, None);
+        assert_eq!(event.auth_mechanism, None);
         assert_eq!(
             event.reason.as_deref(),
             Some("blocked by metadata deny list")

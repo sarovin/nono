@@ -456,24 +456,39 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
         .any(|hp| route_store.has_intercept_route(hp));
     let (cert_cache, intercept_ca_path) = match (&config.intercept_ca_dir, any_intercept_route) {
         (Some(dir), true) => {
-            let ca = Arc::new(EphemeralCa::generate()?);
-            let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
-            let path = tls_intercept::write_bundle(tls_intercept::BundleInputs {
-                dir,
-                filename: "intercept-ca.pem",
-                parent_ssl_cert_file: config.intercept_parent_ca_pems.as_deref(),
-                ephemeral_ca_pem: ca.cert_pem(),
-            })?;
-            info!(
-                "TLS interception active for {} route(s); trust bundle at {}",
-                route_store
-                    .route_upstream_hosts()
-                    .iter()
-                    .filter(|hp| route_store.has_intercept_route(hp))
-                    .count(),
-                path.display()
-            );
-            (Some(cache), Some(path))
+            let intercept_route_count = route_store
+                .route_upstream_hosts()
+                .iter()
+                .filter(|hp| route_store.has_intercept_route(hp))
+                .count();
+            match EphemeralCa::generate().and_then(|ca| {
+                let ca = Arc::new(ca);
+                let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+                let path = tls_intercept::write_bundle(tls_intercept::BundleInputs {
+                    dir,
+                    filename: "intercept-ca.pem",
+                    parent_ssl_cert_file: config.intercept_parent_ca_pems.as_deref(),
+                    ephemeral_ca_pem: ca.cert_pem(),
+                })?;
+                Ok((cache, path))
+            }) {
+                Ok((cache, path)) => {
+                    info!(
+                        "TLS interception active for {} route(s); trust bundle at {}",
+                        intercept_route_count,
+                        path.display()
+                    );
+                    (Some(cache), Some(path))
+                }
+                Err(e) => {
+                    warn!(
+                        "TLS interception setup failed for {} route(s): {}. \
+                         Continuing with interception disabled; reverse-proxy routes remain available.",
+                        intercept_route_count, e
+                    );
+                    (None, None)
+                }
+            }
         }
         (Some(_), false) => {
             debug!(
@@ -639,6 +654,10 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 };
 
                 if state.route_store.is_route_upstream(&host_port) {
+                    let route_id = state
+                        .route_store
+                        .lookup_by_upstream(&host_port)
+                        .map(|(prefix, _)| prefix);
                     let (host, port) = host_port
                         .rsplit_once(':')
                         .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(443)))
@@ -663,6 +682,19 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 audit::log_denied(
                                     Some(&state.audit_log),
                                     audit::ProxyMode::ConnectIntercept,
+                                    &audit::EventContext {
+                                        route_id,
+                                        auth_mechanism: Some(
+                                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                                        ),
+                                        auth_outcome: Some(
+                                            nono::undo::NetworkAuditAuthOutcome::Failed,
+                                        ),
+                                        denial_category: Some(
+                                            nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                                        ),
+                                        ..audit::EventContext::default()
+                                    },
                                     &host,
                                     port,
                                     "proxy auth missing or invalid",
@@ -673,6 +705,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             }
 
                             let ctx = tls_intercept::InterceptCtx {
+                                route_id,
                                 host: &host,
                                 port,
                                 route_store: &state.route_store,
@@ -696,6 +729,13 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             audit::log_denied(
                                 Some(&state.audit_log),
                                 audit::ProxyMode::Connect,
+                                &audit::EventContext {
+                                    route_id,
+                                    denial_category: Some(
+                                        nono::undo::NetworkAuditDenialCategory::ConnectBypassesL7,
+                                    ),
+                                    ..audit::EventContext::default()
+                                },
                                 &host,
                                 port,
                                 "route upstream: CONNECT bypasses L7 filtering",
@@ -919,6 +959,57 @@ mod tests {
         assert!(
             vars.iter().all(|(k, _)| k != "SSL_CERT_FILE"),
             "trust env vars must not be set when intercept inactive"
+        );
+        handle.shutdown();
+    }
+
+    /// Intercept setup failures must not abort proxy startup for reverse-proxy
+    /// routes. We degrade to "intercept off" so credential routes still work,
+    /// while CONNECT interception remains unavailable and will keep its
+    /// existing deny behaviour.
+    #[tokio::test]
+    async fn test_intercept_setup_failure_degrades_without_aborting_proxy() {
+        let missing_dir = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("missing")
+            .join("intercept");
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com".to_string(),
+                credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+            }],
+            intercept_ca_dir: Some(missing_dir),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        assert!(
+            handle.intercept_ca_path().is_none(),
+            "intercept setup failure should disable interception instead of aborting startup"
+        );
+        let vars = handle.env_vars();
+        assert!(
+            vars.iter().all(|(k, _)| k != "SSL_CERT_FILE"),
+            "trust env vars must not be set when interception setup fails"
+        );
+        let route_vars = handle.credential_env_vars(&config);
+        assert!(
+            route_vars.iter().any(|(k, _)| k == "OPENAI_BASE_URL"),
+            "reverse-proxy route env vars should still be emitted"
         );
         handle.shutdown();
     }

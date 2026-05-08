@@ -48,6 +48,12 @@ pub struct LoadedRoute {
     /// time so the CONNECT dispatch path doesn't have to re-derive it on
     /// every request.
     pub requires_intercept: bool,
+
+    /// `true` if this route was configured to use a managed credential
+    /// source (`credential_key` or `oauth2`). Unlike `requires_intercept`,
+    /// this specifically captures whether the proxy must supply upstream
+    /// authentication itself rather than accept agent-provided credentials.
+    pub requires_managed_credential: bool,
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -58,6 +64,10 @@ impl std::fmt::Debug for LoadedRoute {
             .field("endpoint_rules", &self.endpoint_rules)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
             .field("requires_intercept", &self.requires_intercept)
+            .field(
+                "requires_managed_credential",
+                &self.requires_managed_credential,
+            )
             .finish()
     }
 }
@@ -119,9 +129,10 @@ impl RouteStore {
             // they exist to provide a `*_BASE_URL` env var or appear in
             // `route_upstream_hosts()` — and CONNECT to those still gets
             // blocked with 403 (the "force SDK cooperation" path).
-            let requires_intercept = route.credential_key.is_some()
-                || route.oauth2.is_some()
-                || !route.endpoint_rules.is_empty();
+            let requires_managed_credential =
+                route.credential_key.is_some() || route.oauth2.is_some();
+            let requires_intercept =
+                requires_managed_credential || !route.endpoint_rules.is_empty();
 
             loaded.insert(
                 normalized_prefix,
@@ -131,6 +142,7 @@ impl RouteStore {
                     endpoint_rules,
                     tls_connector,
                     requires_intercept,
+                    requires_managed_credential,
                 },
             );
         }
@@ -216,6 +228,19 @@ impl RouteStore {
             .values()
             .filter_map(|route| route.upstream_host_port.clone())
             .collect()
+    }
+}
+
+impl LoadedRoute {
+    /// Whether this route is configured to require a proxy-managed credential
+    /// but the credential material is currently unavailable.
+    #[must_use]
+    pub fn missing_managed_credential(
+        &self,
+        has_static_credential: bool,
+        has_oauth2: bool,
+    ) -> bool {
+        self.requires_managed_credential && !has_static_credential && !has_oauth2
     }
 }
 
@@ -605,11 +630,13 @@ mod tests {
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             tls_connector: None,
             requires_intercept: false,
+            requires_managed_credential: false,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
         assert!(debug_output.contains("has_custom_tls_ca"));
         assert!(debug_output.contains("requires_intercept"));
+        assert!(debug_output.contains("requires_managed_credential"));
     }
 
     #[test]
@@ -633,7 +660,9 @@ mod tests {
             oauth2: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
+        let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
         assert!(store.has_intercept_route("api.openai.com:443"));
+        assert!(hit.1.requires_managed_credential);
         assert!(!store.has_intercept_route("api.example.com:443"));
     }
 
@@ -663,7 +692,11 @@ mod tests {
             oauth2: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
+        let hit = store
+            .lookup_by_upstream("internal.example.com:443")
+            .unwrap();
         assert!(store.has_intercept_route("internal.example.com:443"));
+        assert!(!hit.1.requires_managed_credential);
     }
 
     #[test]
@@ -694,6 +727,31 @@ mod tests {
     }
 
     #[test]
+    fn test_missing_managed_credential_policy() {
+        let managed = LoadedRoute {
+            upstream: "https://api.openai.com".to_string(),
+            upstream_host_port: Some("api.openai.com:443".to_string()),
+            endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
+            tls_connector: None,
+            requires_intercept: true,
+            requires_managed_credential: true,
+        };
+        assert!(managed.missing_managed_credential(false, false));
+        assert!(!managed.missing_managed_credential(true, false));
+        assert!(!managed.missing_managed_credential(false, true));
+
+        let l7_only = LoadedRoute {
+            upstream: "https://internal.example.com".to_string(),
+            upstream_host_port: Some("internal.example.com:443".to_string()),
+            endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
+            tls_connector: None,
+            requires_intercept: true,
+            requires_managed_credential: false,
+        };
+        assert!(!l7_only.missing_managed_credential(false, false));
+    }
+
+    #[test]
     fn test_lookup_by_upstream_returns_prefix() {
         let routes = vec![RouteConfig {
             prefix: "openai".to_string(),
@@ -717,6 +775,7 @@ mod tests {
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
         assert_eq!(hit.0, "openai");
         assert!(hit.1.requires_intercept);
+        assert!(hit.1.requires_managed_credential);
         assert!(store.lookup_by_upstream("api.example.com:443").is_none());
     }
 

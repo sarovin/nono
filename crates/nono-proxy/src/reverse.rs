@@ -33,6 +33,49 @@ use zeroize::Zeroizing;
 /// Maximum request body size (16 MiB). Prevents DoS from malicious Content-Length.
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 
+fn auth_mechanism_for_inject_mode(mode: &InjectMode) -> nono::undo::NetworkAuditAuthMechanism {
+    match mode {
+        InjectMode::Header | InjectMode::BasicAuth => {
+            nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+        }
+        InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
+        InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+    }
+}
+
+fn audit_injection_mode_for_inject_mode(
+    mode: &InjectMode,
+) -> nono::undo::NetworkAuditInjectionMode {
+    match mode {
+        InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
+        InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
+        InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
+        InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+    }
+}
+
+fn proxy_auth_event_ctx<'a>(route_id: &'a str) -> audit::EventContext<'a> {
+    audit::EventContext {
+        route_id: Some(route_id),
+        auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+        ..audit::EventContext::default()
+    }
+}
+
+fn managed_credential_event_ctx<'a>(
+    route_id: &'a str,
+    proxy_mode: &InjectMode,
+    inject_mode: nono::undo::NetworkAuditInjectionMode,
+) -> audit::EventContext<'a> {
+    audit::EventContext {
+        route_id: Some(route_id),
+        auth_mechanism: Some(auth_mechanism_for_inject_mode(proxy_mode)),
+        managed_credential_active: Some(true),
+        injection_mode: Some(inject_mode),
+        ..audit::EventContext::default()
+    }
+}
+
 /// Handle a non-CONNECT HTTP request (reverse proxy mode).
 ///
 /// Reads the full HTTP request from the client, matches path prefix to
@@ -87,6 +130,54 @@ pub async fn handle_reverse_proxy(
         })?;
     let static_cred = ctx.credential_store.get(&service);
     let oauth2_route = ctx.credential_store.get_oauth2(&service);
+    let managed_ctx = static_cred.map(|cred| {
+        managed_credential_event_ctx(
+            &service,
+            &cred.proxy_inject_mode,
+            audit_injection_mode_for_inject_mode(&cred.inject_mode),
+        )
+    });
+    let oauth2_ctx = oauth2_route.map(|_| audit::EventContext {
+        route_id: Some(&service),
+        auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),
+        managed_credential_active: Some(true),
+        injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
+        ..audit::EventContext::default()
+    });
+    let route_ctx = managed_ctx
+        .clone()
+        .or_else(|| oauth2_ctx.clone())
+        .unwrap_or_else(|| audit::EventContext {
+            route_id: Some(&service),
+            managed_credential_active: Some(false),
+            ..audit::EventContext::default()
+        });
+
+    if route.missing_managed_credential(static_cred.is_some(), oauth2_route.is_some()) {
+        let reason = format!(
+            "managed credential unavailable for service '{}': route is configured for proxy-supplied auth",
+            service
+        );
+        warn!("{}", reason);
+        let deny_ctx = audit::EventContext {
+            route_id: Some(&service),
+            managed_credential_active: Some(false),
+            denial_category: Some(
+                nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+            ),
+            ..audit::EventContext::default()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            &service,
+            0,
+            &reason,
+        );
+        send_error(stream, 503, "Service Unavailable").await?;
+        return Ok(());
+    }
 
     // L7 endpoint filtering runs for all reverse-proxy routes, whether or not
     // they inject a credential.
@@ -96,9 +187,14 @@ pub async fn handle_reverse_proxy(
             method, upstream_path, service
         );
         warn!("{}", reason);
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+            ..route_ctx.clone()
+        };
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &deny_ctx,
             &service,
             0,
             &reason,
@@ -138,9 +234,15 @@ pub async fn handle_reverse_proxy(
             cred.proxy_query_param_name.as_deref(),
             ctx.session_token,
         ) {
+            let deny_ctx = audit::EventContext {
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+                ..managed_ctx.clone().unwrap_or_else(|| route_ctx.clone())
+            };
             audit::log_denied(
                 ctx.audit_log,
                 audit::ProxyMode::Reverse,
+                &deny_ctx,
                 &service,
                 0,
                 &e.to_string(),
@@ -149,9 +251,15 @@ pub async fn handle_reverse_proxy(
             return Ok(());
         }
     } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
+        let deny_ctx = audit::EventContext {
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+            ..proxy_auth_event_ctx(&service)
+        };
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &deny_ctx,
             &service,
             0,
             &e.to_string(),
@@ -194,9 +302,14 @@ pub async fn handle_reverse_proxy(
         let reason = check.result.reason();
         warn!("Upstream host denied by filter: {}", reason);
         send_error(stream, 403, "Forbidden").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+            ..route_ctx.clone()
+        };
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &deny_ctx,
             &service,
             0,
             &reason,
@@ -208,15 +321,38 @@ pub async fn handle_reverse_proxy(
     {
         warn!("{}", reason);
         send_error(stream, 502, "Bad Gateway").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..route_ctx.clone()
+        };
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &deny_ctx,
             &service,
             0,
             &reason,
         );
         return Ok(());
     }
+
+    let success_ctx = if let Some(ctx) = managed_ctx.clone() {
+        audit::EventContext {
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            ..ctx
+        }
+    } else if oauth2_ctx.is_some() {
+        audit::EventContext {
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            ..oauth2_ctx.clone().unwrap_or_default()
+        }
+    } else {
+        audit::EventContext {
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            managed_credential_active: Some(false),
+            ..proxy_auth_event_ctx(&service)
+        }
+    };
 
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
     let filtered_headers = filter_headers(remaining_header, strip_header);
@@ -267,6 +403,7 @@ pub async fn handle_reverse_proxy(
     let audit_ctx = AuditCtx {
         log: ctx.audit_log,
         mode: audit::ProxyMode::Reverse,
+        event_ctx: success_ctx.clone(),
         target: &service,
         method: &method,
         path: &upstream_path,
@@ -276,9 +413,14 @@ pub async fn handle_reverse_proxy(
     {
         warn!("Upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..success_ctx.clone()
+        };
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &deny_ctx,
             &service,
             0,
             &e.to_string(),
@@ -313,9 +455,18 @@ async fn handle_oauth2_credential(
     // OAuth2 routes still require the agent to authenticate with the session
     // token — this prevents unauthorized access to the token-exchanged credential.
     if let Err(e) = validate_phantom_token(remaining_header, "Authorization", ctx.session_token) {
+        let deny_ctx = audit::EventContext {
+            route_id: Some(service),
+            auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+            managed_credential_active: Some(true),
+            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+        };
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &deny_ctx,
             service,
             0,
             &e.to_string(),
@@ -339,9 +490,17 @@ async fn handle_oauth2_credential(
         let reason = check.result.reason();
         warn!("Upstream host denied by filter: {}", reason);
         send_error(stream, 403, "Forbidden").await?;
+        let route_ctx = audit::EventContext {
+            route_id: Some(service),
+            managed_credential_active: Some(true),
+            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+            ..audit::EventContext::default()
+        };
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &route_ctx,
             service,
             0,
             &reason,
@@ -353,9 +512,17 @@ async fn handle_oauth2_credential(
     {
         warn!("{}", reason);
         send_error(stream, 502, "Bad Gateway").await?;
+        let route_ctx = audit::EventContext {
+            route_id: Some(service),
+            managed_credential_active: Some(true),
+            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..audit::EventContext::default()
+        };
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &route_ctx,
             service,
             0,
             &reason,
@@ -410,6 +577,14 @@ async fn handle_oauth2_credential(
     let audit_ctx = AuditCtx {
         log: ctx.audit_log,
         mode: audit::ProxyMode::Reverse,
+        event_ctx: audit::EventContext {
+            route_id: Some(service),
+            auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            managed_credential_active: Some(true),
+            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
+            denial_category: None,
+        },
         target: service,
         method,
         path: upstream_path,
@@ -422,6 +597,16 @@ async fn handle_oauth2_credential(
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
+            &audit::EventContext {
+                route_id: Some(service),
+                auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                managed_credential_active: Some(true),
+                injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                ),
+            },
             service,
             0,
             &e.to_string(),

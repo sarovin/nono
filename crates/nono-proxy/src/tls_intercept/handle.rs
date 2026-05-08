@@ -36,6 +36,7 @@ const MAX_HEADER_SIZE: usize = 64 * 1024;
 
 /// Per-connection context passed to [`handle_intercept_connect`].
 pub struct InterceptCtx<'a> {
+    pub route_id: Option<&'a str>,
     pub host: &'a str,
     pub port: u16,
     pub route_store: &'a RouteStore,
@@ -82,6 +83,15 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
             audit::log_denied(
                 ctx.audit_log,
                 audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    route_id: ctx.route_id,
+                    auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::InterceptHandshakeFailed,
+                    ),
+                    ..audit::EventContext::default()
+                },
                 ctx.host,
                 ctx.port,
                 &reason,
@@ -95,6 +105,12 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
     audit::log_allowed(
         ctx.audit_log,
         audit::ProxyMode::ConnectIntercept,
+        &audit::EventContext {
+            route_id: ctx.route_id,
+            auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            ..audit::EventContext::default()
+        },
         ctx.host,
         ctx.port,
         "CONNECT",
@@ -166,6 +182,32 @@ where
         }
     };
     let cred = ctx.credential_store.get(service);
+    let oauth2_route = ctx.credential_store.get_oauth2(service);
+
+    if route.missing_managed_credential(cred.is_some(), oauth2_route.is_some()) {
+        let reason = format!(
+            "managed credential unavailable for route '{}': intercepted request requires proxy-supplied auth",
+            service
+        );
+        warn!("tls_intercept: {}", reason);
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                route_id: ctx.route_id,
+                managed_credential_active: Some(false),
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                ),
+                ..audit::EventContext::default()
+            },
+            ctx.host,
+            ctx.port,
+            &reason,
+        );
+        reverse::send_error_generic(tls_stream, 503, "Service Unavailable").await?;
+        return Ok(());
+    }
 
     // --- L7 endpoint filtering ---
     if !route.endpoint_rules.is_allowed(&method, &path) {
@@ -174,6 +216,18 @@ where
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                route_id: Some(service),
+                managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
+                injection_mode: cred.map(|c| match c.inject_mode {
+                    InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
+                    InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
+                    InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
+                    InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                }),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+                ..audit::EventContext::default()
+            },
             ctx.host,
             ctx.port,
             &reason,
@@ -196,6 +250,29 @@ where
             audit::log_denied(
                 ctx.audit_log,
                 audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    route_id: Some(service),
+                    auth_mechanism: Some(match cred.proxy_inject_mode {
+                        InjectMode::Header | InjectMode::BasicAuth => {
+                            nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                        }
+                        InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
+                        InjectMode::QueryParam => {
+                            nono::undo::NetworkAuditAuthMechanism::PhantomQuery
+                        }
+                    }),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    managed_credential_active: Some(true),
+                    injection_mode: Some(match cred.inject_mode {
+                        InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
+                        InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
+                        InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
+                        InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                    }),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                    ),
+                },
                 ctx.host,
                 ctx.port,
                 &e.to_string(),
@@ -236,6 +313,18 @@ where
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                route_id: Some(service),
+                managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
+                injection_mode: cred.map(|c| match c.inject_mode {
+                    InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
+                    InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
+                    InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
+                    InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                }),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                ..audit::EventContext::default()
+            },
             ctx.host,
             ctx.port,
             &reason,
@@ -294,6 +383,25 @@ where
     let audit_ctx = AuditCtx {
         log: ctx.audit_log,
         mode: audit::ProxyMode::ConnectIntercept,
+        event_ctx: audit::EventContext {
+            route_id: Some(service),
+            auth_mechanism: cred.map(|c| match c.proxy_inject_mode {
+                InjectMode::Header | InjectMode::BasicAuth => {
+                    nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                }
+                InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
+                InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+            }),
+            auth_outcome: cred.map(|_| nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
+            injection_mode: cred.map(|c| match c.inject_mode {
+                InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
+                InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
+                InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
+                InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+            }),
+            denial_category: None,
+        },
         target: ctx.host,
         method: &method,
         path: &path,
@@ -311,6 +419,27 @@ where
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                route_id: Some(service),
+                auth_mechanism: cred.map(|c| match c.proxy_inject_mode {
+                    InjectMode::Header | InjectMode::BasicAuth => {
+                        nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                    }
+                    InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
+                    InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+                }),
+                auth_outcome: cred.map(|_| nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
+                injection_mode: cred.map(|c| match c.inject_mode {
+                    InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
+                    InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
+                    InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
+                    InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                }),
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                ),
+            },
             ctx.host,
             ctx.port,
             &e.to_string(),
