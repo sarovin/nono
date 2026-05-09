@@ -316,6 +316,52 @@ uname -r
 
 ---
 
+## Using `nono learn` to Discover Required Paths
+
+If you're getting permission errors and aren't sure which paths your application needs, use `nono learn` on Linux or run the command under the target profile on macOS:
+
+```bash
+# Linux: discover all paths accessed by your app
+nono learn -- my-app
+
+# Linux: compare against an existing profile to see what's missing
+nono learn --profile my-profile -- my-app
+
+# Linux: output as JSON for easy profile creation
+nono learn --json -- my-app
+
+# macOS: collect real Seatbelt denials and offer to save a profile patch
+nono run --profile my-profile -- my-app
+```
+
+<Note>
+  On Linux, `nono learn` requires `strace` and runs without sandbox restrictions. On macOS, prefer sandboxed `nono run`; legacy unsandboxed tracing is still available with `nono learn --trace` and requires `sudo` for `fs_usage` and `nettop`.
+</Note>
+
+### Example Workflow
+
+1. Run the command to discover paths:
+   ```bash
+   nono run --profile opencode -- opencode
+   ```
+
+2. Review the output to see which paths are needed:
+   ```
+   Read paths needed:
+     /usr/share/locale-langpack
+     /home/user/.config/opencode
+
+   Write paths needed:
+     /home/user/.cache/opencode
+   ```
+
+3. Add the paths to your nono command or profile:
+   ```bash
+   nono run --read /usr/share/locale-langpack --allow ~/.config/opencode -- opencode
+   ```
+
+---
+
 ## WSL2-Specific Issues
 
 ### Sandbox initialization: EBUSY on seccomp

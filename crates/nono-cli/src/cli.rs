@@ -32,7 +32,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   wrap       Apply sandbox and exec into command (nono disappears)
 
 \x1b[1mEXPLORATION & DEBUGGING\x1b[0m
-  learn      Trace a command to discover required filesystem paths
+  learn      Discover required filesystem paths
   why        Check why a path or network operation would be allowed or denied
 
 \x1b[1mSESSION MANAGEMENT\x1b[0m
@@ -175,7 +175,7 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// Trace a command to discover required filesystem paths
+    /// Discover required filesystem paths
     #[command(trailing_var_arg = true)]
     #[command(help_template = "\
 {about}
@@ -193,7 +193,8 @@ pub enum Commands {
 
 \x1b[1mPLATFORM NOTES\x1b[0m
   Linux   Uses strace (install with: apt install strace)
-  macOS   Uses fs_usage (requires sudo)
+  macOS   Prefer: nono run --profile <name> -- <command>
+          Legacy unsandboxed fs_usage/nettop tracing: nono learn --trace -- <command>
 ")]
     Learn(Box<LearnArgs>),
 
@@ -1715,6 +1716,10 @@ pub struct LearnArgs {
     /// Skip reverse DNS lookups for discovered IPs
     #[arg(long, help_heading = "OPTIONS")]
     pub no_rdns: bool,
+
+    /// On macOS, use legacy unsandboxed fs_usage/nettop tracing
+    #[arg(long, help_heading = "OPTIONS")]
+    pub trace: bool,
 
     /// Enable verbose output
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]

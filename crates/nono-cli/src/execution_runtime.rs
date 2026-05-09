@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 use tracing::{error, info};
 
-const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
@@ -136,6 +136,19 @@ fn should_apply_startup_timeout(
     recommended_profile.is_some() && cmd_args.is_empty()
 }
 
+fn startup_timeout_profile<'a>(
+    recommended_profile: Option<&'a str>,
+    explicit_profile: Option<&str>,
+) -> Option<&'a str> {
+    let recommended = recommended_profile?;
+    if let Some(explicit) = explicit_profile {
+        if explicit == recommended || explicit == format!("{recommended}-local") {
+            return None;
+        }
+    }
+    Some(recommended)
+}
+
 pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let LaunchPlan {
         program,
@@ -171,11 +184,14 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     let resolved_program = exec_strategy::resolve_program(&command[0])?;
+    let known_builtin_profile = recommended_builtin_profile(&resolved_program);
     let recommended_profile = if flags.session.profile_name.is_none() {
-        recommended_builtin_profile(&resolved_program)
+        known_builtin_profile
     } else {
         None
     };
+    let startup_timeout_profile =
+        startup_timeout_profile(known_builtin_profile, flags.session.profile_name.as_deref());
 
     let recommended_program_name = resolved_program
         .file_name()
@@ -297,8 +313,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .profile_name
             .as_deref()
             .or(recommended_profile),
-        startup_timeout: if should_apply_startup_timeout(recommended_profile, &cmd_args) {
-            recommended_profile.map(|profile| exec_strategy::StartupTimeoutConfig {
+        startup_timeout: if should_apply_startup_timeout(startup_timeout_profile, &cmd_args) {
+            startup_timeout_profile.map(|profile| exec_strategy::StartupTimeoutConfig {
                 timeout: PROFILE_HINT_STARTUP_TIMEOUT,
                 program: recommended_program_name,
                 profile,
@@ -397,6 +413,7 @@ fn write_capability_state_file(
 mod tests {
     use super::{
         compute_executable_identity, recommended_builtin_profile, should_apply_startup_timeout,
+        startup_timeout_profile,
     };
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -428,6 +445,27 @@ mod tests {
             &["--version"]
         ));
         assert!(!should_apply_startup_timeout(None, &no_args));
+    }
+
+    #[test]
+    fn startup_timeout_profile_ignores_matching_explicit_profile_only() {
+        assert_eq!(
+            startup_timeout_profile(Some("claude-code"), None),
+            Some("claude-code")
+        );
+        assert_eq!(
+            startup_timeout_profile(Some("claude-code"), Some("default")),
+            Some("claude-code")
+        );
+        assert_eq!(
+            startup_timeout_profile(Some("claude-code"), Some("claude-code")),
+            None
+        );
+        assert_eq!(
+            startup_timeout_profile(Some("claude-code"), Some("claude-code-local")),
+            None
+        );
+        assert_eq!(startup_timeout_profile(None, Some("default")), None);
     }
 
     #[test]
