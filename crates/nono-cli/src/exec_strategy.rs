@@ -71,7 +71,7 @@ const MAX_DENIAL_RECORDS: usize = 1000;
 const MAX_TRACKED_REQUEST_IDS: usize = 4096;
 /// Quiet period used to drain final PTY output after child exit before parent
 /// diagnostics/prompts take over the terminal.
-const POST_EXIT_PTY_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const POST_EXIT_PTY_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn offer_profile_save_for_child(
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
