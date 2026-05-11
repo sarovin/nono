@@ -4,6 +4,17 @@
 
 ### Bug Fixes
 
+- *(profile-save)* Address suppression review feedback
+
+
+### Features
+
+- *(profile-save)* Suppress save-profile prompts for denied paths
+
+## [0.52.1] - 2026-05-11
+
+### Bug Fixes
+
 - Match backend validation logic
 
 - *(schema)* Add missing 'environment' property to profile JSON schema
