@@ -134,10 +134,15 @@ pub struct RouteConfig {
     pub inject_header: String,
 
     /// Format string for the credential value. `{}` is replaced with the secret.
-    /// Default: "Bearer {}"
+    ///
+    /// When omitted (`None`), the effective format is chosen at load time:
+    /// `Bearer {}` for the `Authorization` header, `{}` for any other header name.
+    /// When set to any string (including explicit `Bearer {}` on a custom header),
+    /// that format is used exactly.
+    ///
     /// Only used when inject_mode is "header".
-    #[serde(default = "default_credential_format")]
-    pub credential_format: String,
+    #[serde(default)]
+    pub credential_format: Option<String>,
 
     // --- URL path mode fields ---
     /// Pattern to match in incoming URL path. Use {} as placeholder for phantom token.
@@ -371,8 +376,24 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-fn default_credential_format() -> String {
-    "Bearer {}".to_string()
+/// Resolve the credential header format for injection.
+///
+/// When `credential_format` is `None` (field omitted from config), uses `Bearer {}`
+/// for the `Authorization` header and `{}` for all other header names. When `Some`,
+/// returns that format unchanged so explicit values (including `Bearer {}` on a
+/// non-Authorization header) are honored.
+#[must_use]
+pub fn resolved_credential_format(inject_header: &str, credential_format: Option<&str>) -> String {
+    match credential_format {
+        Some(fmt) => fmt.to_string(),
+        None => {
+            if inject_header == "Authorization" {
+                "Bearer {}".to_string()
+            } else {
+                "{}".to_string()
+            }
+        }
+    }
 }
 
 /// Configuration for an external (enterprise) proxy.
@@ -817,5 +838,38 @@ mod tests {
         let route: RouteConfig = serde_json::from_str(json).unwrap();
         assert!(route.oauth2.is_none());
         assert!(route.credential_key.is_some());
+    }
+
+    #[test]
+    fn test_route_config_credential_format_omitted_is_none() {
+        let json = r#"{
+            "prefix": "anthropic",
+            "upstream": "https://api.anthropic.com",
+            "credential_key": "env://ANTHROPIC_API_KEY",
+            "inject_header": "x-api-key"
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.credential_format.is_none());
+        assert_eq!(
+            resolved_credential_format(&route.inject_header, route.credential_format.as_deref()),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_route_config_explicit_bearer_on_custom_header_preserved() {
+        let json = r#"{
+            "prefix": "litellm",
+            "upstream": "https://litellm",
+            "credential_key": "env://LITELLM_TOKEN",
+            "inject_header": "x-litellm-api-key",
+            "credential_format": "Bearer {}"
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(route.credential_format.as_deref(), Some("Bearer {}"));
+        assert_eq!(
+            resolved_credential_format(&route.inject_header, route.credential_format.as_deref()),
+            "Bearer {}"
+        );
     }
 }
