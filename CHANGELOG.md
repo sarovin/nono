@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.56.0] - 2026-05-18
+
+### Bug Fixes
+
+- *(startup)* Use SIGKILL consistently and remove dead prompt infrastructure
+
+
+### CI/CD
+
+- Add standalone homebrew-bump workflow; pin to AvesAlight fork for 3xx redirect fix
+
+
+### Documentation
+
+- *(cli)* Clarify startup timeout definition of interactive
+
+
+### Features
+
+- *(cli)* Expand startup timeout interactive detection
+
+- *(cli)* Add option to configure process startup timeout
+
+
+### Refactoring
+
+- *(cli)* Simplify startup timeout check
+
+- *(cli-exec-strategy)* Simplify startup timeout checks
+
+- *(cli)* Require alt-screen for startup timeout
+
 ## [0.55.0] - 2026-05-17
 
 
