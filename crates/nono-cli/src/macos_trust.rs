@@ -17,6 +17,13 @@ use tracing::{debug, info, warn};
 use x509_parser::pem::parse_x509_pem;
 use zeroize::Zeroizing;
 
+/// Internal error type to distinguish user-cancelled trust prompts from other
+/// failures without relying on string matching.
+enum TrustCertError {
+    UserCancelled,
+    Other(NonoError),
+}
+
 // Service name for Keychain items. Sufficiently specific to avoid collision
 // with other apps. set_generic_password overwrites on conflict (desired).
 const KEYCHAIN_SERVICE: &str = "nono-proxy-ca";
@@ -57,14 +64,16 @@ fn try_ensure_trusted_ca() -> Result<Option<PreloadedCa>> {
             if !is_cert_trusted(&cert) {
                 info!("Re-trusting proxy CA (you may be prompted for authentication)...");
                 if let Err(e) = trust_cert(&cert) {
-                    if is_user_cancelled_error(&e) {
-                        warn!(
-                            "Trust store auth cancelled. Falling back to ephemeral CA. \
-                             Go CLI tools won't validate proxy certs; other tools still work."
-                        );
-                        return Ok(None);
+                    match e {
+                        TrustCertError::UserCancelled => {
+                            warn!(
+                                "Trust store auth cancelled. Falling back to ephemeral CA. \
+                                 Go CLI tools won't validate proxy certs; other tools still work."
+                            );
+                            return Ok(None);
+                        }
+                        TrustCertError::Other(err) => return Err(err),
                     }
-                    return Err(e);
                 }
                 info!("Proxy CA re-trusted successfully");
             } else {
@@ -125,14 +134,16 @@ fn generate_and_trust_new_ca() -> Result<Option<PreloadedCa>> {
 
     info!("Adding proxy CA to macOS trust store (you may be prompted for authentication)...");
     if let Err(e) = trust_cert(&sec_cert) {
-        if is_user_cancelled_error(&e) {
-            warn!(
-                "Trust store auth cancelled. Falling back to ephemeral CA. \
-                 Go CLI tools won't validate proxy certs; other tools still work."
-            );
-            return Ok(None);
+        match e {
+            TrustCertError::UserCancelled => {
+                warn!(
+                    "Trust store auth cancelled. Falling back to ephemeral CA. \
+                     Go CLI tools won't validate proxy certs; other tools still work."
+                );
+                return Ok(None);
+            }
+            TrustCertError::Other(err) => return Err(err),
         }
-        return Err(e);
     }
 
     info!("Proxy CA added to macOS trust store");
@@ -153,11 +164,31 @@ fn ensure_cert_in_keychain(cert: &SecCertificate) -> Result<()> {
     Ok(())
 }
 
-fn trust_cert(cert: &SecCertificate) -> Result<()> {
-    ensure_cert_in_keychain(cert)?;
+/// OSStatus codes that indicate the user refused the authentication prompt.
+const ERR_SEC_USER_CANCELED: i32 = -128;
+const ERR_SEC_AUTH_FAILED: i32 = -25293;
+const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+
+fn is_user_cancelled_osstatus(code: i32) -> bool {
+    matches!(
+        code,
+        ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED
+    )
+}
+
+fn trust_cert(cert: &SecCertificate) -> std::result::Result<(), TrustCertError> {
+    ensure_cert_in_keychain(cert).map_err(TrustCertError::Other)?;
     TrustSettings::new(Domain::User)
         .set_trust_settings_always(cert)
-        .map_err(|e| NonoError::SandboxInit(format!("failed to set trust settings: {e}")))
+        .map_err(|e| {
+            if is_user_cancelled_osstatus(e.code()) {
+                TrustCertError::UserCancelled
+            } else {
+                TrustCertError::Other(NonoError::SandboxInit(format!(
+                    "failed to set trust settings: {e}"
+                )))
+            }
+        })
 }
 
 fn is_cert_trusted(cert: &SecCertificate) -> bool {
@@ -232,15 +263,6 @@ fn generate_ca_material() -> Result<(Zeroizing<Vec<u8>>, String)> {
     ))
 }
 
-fn is_user_cancelled_error(err: &NonoError) -> bool {
-    let msg = err.to_string();
-    msg.contains("cancelled")
-        || msg.contains("canceled")
-        || msg.contains("errSecAuthFailed")
-        || msg.contains("User interaction is not allowed")
-        || msg.contains("errSecInternalComponent")
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -289,11 +311,11 @@ mod tests {
     }
 
     #[test]
-    fn is_user_cancelled_detects_cancel_messages() {
-        let err = NonoError::SandboxInit("failed to set trust settings: cancelled".to_string());
-        assert!(is_user_cancelled_error(&err));
-
-        let err = NonoError::SandboxInit("some other error".to_string());
-        assert!(!is_user_cancelled_error(&err));
+    fn is_user_cancelled_osstatus_detects_known_codes() {
+        assert!(is_user_cancelled_osstatus(ERR_SEC_USER_CANCELED));
+        assert!(is_user_cancelled_osstatus(ERR_SEC_AUTH_FAILED));
+        assert!(is_user_cancelled_osstatus(ERR_SEC_INTERACTION_NOT_ALLOWED));
+        assert!(!is_user_cancelled_osstatus(-25299)); // errSecDuplicateItem
+        assert!(!is_user_cancelled_osstatus(0));
     }
 }
