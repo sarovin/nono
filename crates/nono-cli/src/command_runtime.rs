@@ -150,6 +150,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             ignored_denial_paths: prepared.ignored_denial_paths,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            startup_timeout_secs: args.startup_timeout_secs,
             proxy,
             redaction_policy: load_configured_redaction_policy()?,
             session: SessionLaunchOptions {

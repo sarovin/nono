@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.57.0] - 2026-05-19
+
+### Bug Fixes
+
+- *(profile)* Fix fmt and test assertion after shadow-check refactor
+
+- *(profile)* Handle versioned package refs in fast path
+
+- *(profiles)* Block profile init when name shadows builtin or pack profile
+
+- *(profiles)* Address review points on shadow-check PR
+
+
+### Dependencies
+
+- *(deps)* Bump aws-lc-rs from 1.16.3 to 1.17.0
+
+
+### Features
+
+- *(profile)* Refine profile name resolution and init validation
+
+- *(profiles)* Expand shadowing checks to include pack profiles
+
+## [0.56.0] - 2026-05-18
+
+### Bug Fixes
+
+- *(startup)* Use SIGKILL consistently and remove dead prompt infrastructure
+
+
+### CI/CD
+
+- Add standalone homebrew-bump workflow; pin to AvesAlight fork for 3xx redirect fix
+
+
+### Documentation
+
+- *(cli)* Clarify startup timeout definition of interactive
+
+
+### Features
+
+- *(cli)* Expand startup timeout interactive detection
+
+- *(cli)* Add option to configure process startup timeout
+
+
+### Refactoring
+
+- *(cli)* Simplify startup timeout check
+
+- *(cli-exec-strategy)* Simplify startup timeout checks
+
+- *(cli)* Require alt-screen for startup timeout
+
 ## [0.55.0] - 2026-05-17
 
 

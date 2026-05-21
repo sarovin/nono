@@ -799,28 +799,6 @@ impl PtyProxy {
         }
     }
 
-    /// Re-enter raw mode and redraw the current PTY screen after a prompt.
-    pub fn resume_terminal_after_prompt(&mut self) {
-        if !self
-            .client
-            .as_ref()
-            .is_some_and(AttachedClient::is_terminal)
-        {
-            return;
-        }
-
-        self.saved_termios = set_terminal_raw();
-        // The replay bytes from `attach_replay_bytes` now include the
-        // alt-screen entry escape themselves when the child is in alt-screen,
-        // so no separate `enter_attach_screen()` call is needed. Staying in
-        // normal-screen mode for non-TUI sessions preserves the outer
-        // terminal's scrollback and mouse-wheel handling.
-        let replay = self.attach_replay_bytes();
-        if let Some(client) = self.client.as_ref() {
-            let _ = write_all_fd(client.write_fd(), &replay);
-        }
-    }
-
     /// Restore terminal settings.
     fn restore_terminal(&mut self) {
         if let Some(ref termios) = self.saved_termios {
@@ -979,6 +957,15 @@ impl PtyProxy {
             .render_plaintext()
             .chars()
             .any(|ch| !ch.is_whitespace())
+    }
+
+    /// Returns true once the child has entered alt-screen mode. This is the
+    /// reliable signal that a TUI has become interactive. Plain log lines or
+    /// startup banners written to the PTY do not activate alt-screen and do
+    /// not count, so a process that prints output and then hangs is still
+    /// subject to the startup timeout.
+    pub fn is_interactive(&self) -> bool {
+        self.screen.alternate_screen_active()
     }
 
     fn attach_replay_bytes(&self) -> Vec<u8> {
