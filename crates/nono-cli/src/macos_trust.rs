@@ -27,8 +27,7 @@ enum TrustCertError {
 // Service name for Keychain items. Sufficiently specific to avoid collision
 // with other apps. set_generic_password overwrites on conflict (desired).
 const KEYCHAIN_SERVICE: &str = "nono-proxy-ca";
-const KEYCHAIN_ACCOUNT_KEY: &str = "private-key";
-const KEYCHAIN_ACCOUNT_CERT: &str = "certificate-pem";
+const KEYCHAIN_ACCOUNT: &str = "ca-bundle";
 
 /// Load or generate a shared CA and ensure it's trusted in the macOS user
 /// trust store. Returns `Some(PreloadedCa)` on success, `None` if the user
@@ -80,10 +79,7 @@ fn try_ensure_trusted_ca() -> Result<Option<PreloadedCa>> {
                 info!("Reusing proxy CA from Keychain (already trusted)");
             }
 
-            Ok(Some(PreloadedCa {
-                key_der: Zeroizing::new(key_der),
-                cert_pem,
-            }))
+            Ok(Some(PreloadedCa { key_der, cert_pem }))
         }
         None => {
             debug!("no existing proxy CA in Keychain; generating new one");
@@ -92,41 +88,32 @@ fn try_ensure_trusted_ca() -> Result<Option<PreloadedCa>> {
     }
 }
 
-fn load_existing_ca() -> Result<Option<(Vec<u8>, String)>> {
-    let key = match passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_KEY) {
+fn load_existing_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
+    let bundle = match passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
         Ok(data) => data,
         Err(_) => return Ok(None),
     };
-    let cert_bytes = match passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_CERT)
-    {
-        Ok(data) => data,
-        Err(_) => return Ok(None),
-    };
-    let cert_pem = String::from_utf8(cert_bytes).map_err(|e| {
-        NonoError::SandboxInit(format!("stored CA cert PEM is not valid UTF-8: {e}"))
-    })?;
-
-    // Verify key and cert are a valid pair. The proxy will call from_existing()
-    // again at startup — this intentional double-check catches corruption before
-    // we attempt trust store operations.
-    if let Err(e) = nono_proxy::tls_intercept::ca::EphemeralCa::from_existing(&key, &cert_pem) {
-        warn!("Stored CA key/cert pair is invalid ({e}); regenerating");
-        return Ok(None);
-    }
-
-    Ok(Some((key, cert_pem)))
+    let combined = String::from_utf8(bundle)
+        .map_err(|e| NonoError::SandboxInit(format!("stored CA bundle is not valid UTF-8: {e}")))?;
+    nono_proxy::tls_intercept::ca::split_key_cert_pem(&combined)
+        .map(Some)
+        .map_err(|e| NonoError::SandboxInit(format!("{e}")))
 }
 
 fn generate_and_trust_new_ca() -> Result<Option<PreloadedCa>> {
-    let (key_der, cert_pem) = generate_ca_material()?;
+    let ca = nono_proxy::tls_intercept::ca::EphemeralCa::generate_with_cn("nono-proxy-ca")
+        .map_err(|e| NonoError::SandboxInit(format!("failed to generate CA: {e}")))?;
+    let key_der = Zeroizing::new(ca.key_der().to_vec());
+    let cert_pem = ca.cert_pem().to_string();
 
-    // Note: concurrent nono processes may race here — second writer wins.
-    // This is benign: the losing process already has its material in memory,
-    // and next session's load_existing_ca validates the pair before use.
-    passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_KEY, &key_der)
-        .map_err(|e| NonoError::SandboxInit(format!("failed to store CA key in Keychain: {e}")))?;
-    passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_CERT, cert_pem.as_bytes())
-        .map_err(|e| NonoError::SandboxInit(format!("failed to store CA cert in Keychain: {e}")))?;
+    // Single atomic write — concurrent processes race, but the bundle is always
+    // a coherent key+cert pair (second writer wins, no mismatch possible).
+    let key_pem = ca.key_pem();
+    let combined = Zeroizing::new(format!("{}{}", &*key_pem, cert_pem));
+    passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, combined.as_bytes())
+        .map_err(|e| {
+            NonoError::SandboxInit(format!("failed to store CA bundle in Keychain: {e}"))
+        })?;
 
     let cert_der = pem_to_der(&cert_pem)?;
     let sec_cert = SecCertificate::from_der(&cert_der)
@@ -230,8 +217,7 @@ fn remove_cert_from_keychain(cert_pem: &str) {
 }
 
 fn delete_existing_ca() {
-    let _ = passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_KEY);
-    let _ = passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_CERT);
+    let _ = passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
 }
 
 fn cert_pem_is_valid(cert_pem: &str) -> Result<bool> {
@@ -254,36 +240,33 @@ fn pem_to_der(cert_pem: &str) -> Result<Vec<u8>> {
     Ok(pem.contents.to_vec())
 }
 
-fn generate_ca_material() -> Result<(Zeroizing<Vec<u8>>, String)> {
-    let ca = nono_proxy::tls_intercept::ca::EphemeralCa::generate_with_cn("nono-proxy-ca")
-        .map_err(|e| NonoError::SandboxInit(format!("failed to generate CA: {e}")))?;
-    Ok((
-        Zeroizing::new(ca.key_der().to_vec()),
-        ca.cert_pem().to_string(),
-    ))
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use nono_proxy::tls_intercept::ca::EphemeralCa;
+
+    fn generate_test_ca() -> EphemeralCa {
+        EphemeralCa::generate_with_cn("nono-proxy-ca").unwrap()
+    }
 
     #[test]
-    fn generate_ca_material_produces_valid_output() {
-        let (key_der, cert_pem) = generate_ca_material().unwrap();
+    fn combined_pem_roundtrips() {
+        use nono_proxy::tls_intercept::ca::split_key_cert_pem;
 
-        assert!(!key_der.is_empty());
-        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        let ca = generate_test_ca();
+        let combined = format!("{}{}", &*ca.key_pem(), ca.cert_pem());
 
-        let ca =
-            nono_proxy::tls_intercept::ca::EphemeralCa::from_existing(&key_der, &cert_pem).unwrap();
-        assert_eq!(ca.cert_pem(), cert_pem);
+        let (key_der, cert_pem) = split_key_cert_pem(&combined).unwrap();
+        assert_eq!(&*key_der, ca.key_der());
+        assert_eq!(cert_pem, ca.cert_pem());
+        EphemeralCa::from_existing(&key_der, &cert_pem).unwrap();
     }
 
     #[test]
     fn cert_pem_is_valid_returns_true_for_fresh_cert() {
-        let (_, cert_pem) = generate_ca_material().unwrap();
-        assert!(cert_pem_is_valid(&cert_pem).unwrap());
+        let ca = generate_test_ca();
+        assert!(cert_pem_is_valid(ca.cert_pem()).unwrap());
     }
 
     #[test]
@@ -295,8 +278,8 @@ mod tests {
     fn pem_to_der_roundtrips() {
         use x509_parser::prelude::FromDer;
 
-        let (_, cert_pem) = generate_ca_material().unwrap();
-        let der = pem_to_der(&cert_pem).unwrap();
+        let ca = generate_test_ca();
+        let der = pem_to_der(ca.cert_pem()).unwrap();
         assert!(!der.is_empty());
         let (_, cert) = x509_parser::prelude::X509Certificate::from_der(&der).unwrap();
         assert_eq!(

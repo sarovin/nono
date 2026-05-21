@@ -179,6 +179,24 @@ impl EphemeralCa {
         &self.key_pkcs8_der
     }
 
+    /// PKCS#8 PEM-encoded private key for combined storage. Zeroized on drop.
+    #[must_use]
+    pub fn key_pem(&self) -> Zeroizing<String> {
+        use base64::Engine;
+        use zeroize::Zeroize;
+        let mut encoded = base64::engine::general_purpose::STANDARD.encode(&*self.key_pkcs8_der);
+        let mut pem = String::with_capacity(encoded.len() + 64);
+        pem.push_str("-----BEGIN PRIVATE KEY-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            // base64 output is always ASCII — valid UTF-8 by construction
+            pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+            pem.push('\n');
+        }
+        pem.push_str("-----END PRIVATE KEY-----\n");
+        encoded.zeroize();
+        Zeroizing::new(pem)
+    }
+
     /// Authoritative DER bytes of the CA certificate for TLS chains.
     ///
     /// In `from_existing()` this is the original cert (matching the trust
@@ -233,6 +251,42 @@ fn validate_key_cert_binding(key_pair: &KeyPair, cert_der: &[u8]) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+/// Split a combined PEM bundle (PKCS#8 key + certificate) into DER key bytes
+/// and certificate PEM. The key material is returned in `Zeroizing` for safe
+/// memory handling.
+pub fn split_key_cert_pem(combined: &str) -> Result<(Zeroizing<Vec<u8>>, String)> {
+    use base64::Engine;
+    use zeroize::Zeroize;
+
+    const BEGIN_KEY: &str = "-----BEGIN PRIVATE KEY-----";
+    const END_KEY: &str = "-----END PRIVATE KEY-----";
+
+    let key_start = combined
+        .find(BEGIN_KEY)
+        .ok_or_else(|| ProxyError::Config("CA bundle missing PRIVATE KEY block".to_string()))?;
+    let key_end = combined
+        .find(END_KEY)
+        .ok_or_else(|| ProxyError::Config("CA bundle missing END PRIVATE KEY".to_string()))?;
+
+    let b64_start = key_start + BEGIN_KEY.len();
+    let mut b64 = combined[b64_start..key_end].replace(['\n', '\r', ' '], "");
+    let key_der = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|e| ProxyError::Config(format!("CA key base64 invalid: {e}")))?,
+    );
+    b64.zeroize();
+
+    let cert_pem = combined[key_end + END_KEY.len()..].trim_start().to_string();
+    if cert_pem.is_empty() {
+        return Err(ProxyError::Config(
+            "CA bundle missing certificate PEM".to_string(),
+        ));
+    }
+
+    Ok((key_der, cert_pem))
 }
 
 /// Convert `SystemTime` to the `time::OffsetDateTime` that `rcgen` expects.
@@ -349,5 +403,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn key_pem_roundtrips_to_der() {
+        use base64::Engine;
+
+        let ca = EphemeralCa::generate().unwrap();
+        let pem = ca.key_pem();
+
+        let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(decoded, ca.key_der());
+    }
+
+    #[test]
+    fn split_key_cert_pem_roundtrips() {
+        let ca = EphemeralCa::generate_with_cn("nono-proxy-ca").unwrap();
+        let combined = format!("{}{}", &*ca.key_pem(), ca.cert_pem());
+
+        let (key_der, cert_pem) = split_key_cert_pem(&combined).unwrap();
+        assert_eq!(&*key_der, ca.key_der());
+        assert_eq!(cert_pem, ca.cert_pem());
+    }
+
+    #[test]
+    fn split_key_cert_pem_rejects_missing_key() {
+        let ca = EphemeralCa::generate().unwrap();
+        assert!(split_key_cert_pem(ca.cert_pem()).is_err());
+    }
+
+    #[test]
+    fn split_key_cert_pem_rejects_missing_cert() {
+        let ca = EphemeralCa::generate().unwrap();
+        assert!(split_key_cert_pem(&ca.key_pem()).is_err());
     }
 }
