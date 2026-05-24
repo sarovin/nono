@@ -111,6 +111,7 @@ pub fn show_pack_update_hints(profile_name: &str, silent: bool) {
 /// Refresh stale hint cache entries for the hidden helper subcommand.
 pub fn run_refresh_helper(args: crate::cli::PackUpdateHintHelperArgs) -> crate::Result<()> {
     let Some(stale) = parse_refresh_helper_args(args.packs) else {
+        tracing::debug!("pack update hint helper received malformed pack/version arguments");
         return Ok(());
     };
     if stale.is_empty() || is_opted_out() {
@@ -280,7 +281,13 @@ fn save_state(state: &PackHintsState) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_string_pretty(state) {
-        let _ = std::fs::write(&path, json);
+        let tmp_path =
+            path.with_file_name(format!(".{HINTS_STATE_FILE}.{}.tmp", std::process::id()));
+        let write_result = std::fs::write(&tmp_path, format!("{json}\n"))
+            .and_then(|()| std::fs::rename(&tmp_path, &path));
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
     }
 }
 
