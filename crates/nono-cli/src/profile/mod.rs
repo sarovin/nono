@@ -301,7 +301,7 @@ pub struct CustomCredentialDef {
     ///
     /// When set, the proxy uses this as the SDK API key env var instead of
     /// deriving it from `credential_key.to_uppercase()`. Required when
-    /// `credential_key` is a URI manager reference (`op://`,
+    /// `credential_key` is a URI manager reference (`op://`, `bw://`,
     /// `apple-password://`, or `file://`).
     #[serde(default)]
     pub env_var: Option<String>,
@@ -371,6 +371,7 @@ fn is_http_token_char(c: char) -> bool {
 /// Accepts either:
 /// - A bare keyring account name (alphanumeric + underscores only)
 /// - A 1Password `op://` URI (validated by `nono::keystore::validate_op_uri`)
+/// - A Bitwarden `bw://` URI (validated by `nono::keystore::validate_bw_uri`)
 /// - An Apple Passwords `apple-password://` URI
 /// - A `file://` URI pointing to an absolute path (validated by `nono::keystore::validate_file_uri`)
 /// - An `env://` URI referencing a host environment variable (validated by `nono::keystore::validate_env_uri`)
@@ -387,6 +388,13 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
         nono::keystore::validate_op_uri(key).map_err(|e| {
             NonoError::ProfileParse(format!(
                 "invalid 1Password URI for custom credential '{}': {}",
+                context_name, e
+            ))
+        })
+    } else if nono::keystore::is_bw_uri(key) {
+        nono::keystore::validate_bw_uri(key).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid Bitwarden URI for custom credential '{}': {}",
                 context_name, e
             ))
         })
@@ -416,7 +424,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(NonoError::ProfileParse(format!(
                 "credential_key '{}' for custom credential '{}' must contain only \
-                 alphanumeric characters and underscores (or use op:// / apple-password:// / file:// / env:// URI)",
+                 alphanumeric characters and underscores (or use op:// / bw:// / apple-password:// / file:// / env:// URI)",
                 key, context_name
             )));
         }
@@ -428,7 +436,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///
 /// Checks:
 /// - `credential_key` must be alphanumeric + underscores only, or a valid
-///   `op://` / `apple-password://` / `file://` / `env://` URI
+///   `op://` / `bw://` / `apple-password://` / `file://` / `env://` URI
 /// - `upstream` must be HTTPS (or HTTP for loopback only)
 /// - Mode-specific validation:
 ///   - `header`: inject_header must be valid HTTP token; effective format (see field doc) must not contain CR/LF
@@ -466,13 +474,14 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         // uppercased into an env var name, so env_var is required for them.
         // env:// is exempt: the var name is derived from the URI itself.
         if (nono::keystore::is_op_uri(key)
+            || nono::keystore::is_bw_uri(key)
             || nono::keystore::is_apple_password_uri(key)
             || nono::keystore::is_file_uri(key))
             && cred.env_var.is_none()
         {
             return Err(NonoError::ProfileParse(format!(
                 "env_var is required for custom credential '{}' when credential_key is a URI \
-                 manager reference (op://, apple-password://, or file://); \
+                 manager reference (op://, bw://, apple-password://, or file://); \
                  set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
                 name
             )));
@@ -652,7 +661,7 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
 /// - `token_url` must be HTTPS (or HTTP for loopback addresses)
 /// - `client_id` must not be empty
 /// - `client_secret` must not be empty and must be a credential reference
-///   (env://, file://, op://, apple-password://) or plain value
+///   (env://, file://, op://, bw://, apple-password://) or plain value
 fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     // Validate token_url — same rules as upstream URL (HTTPS or loopback HTTP)
     validate_upstream_url(&auth.token_url, &format!("{}/auth.token_url", name))?;
@@ -840,8 +849,8 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
 
 /// Validate env_credentials keys in a profile.
 ///
-/// Keys can be keyring account names, `op://` URIs, `apple-password://` URIs,
-/// `keyring://` URIs, `env://` URIs, or `file://` URIs.
+/// Keys can be keyring account names, `op://` URIs, `bw://` URIs,
+/// `apple-password://` URIs, `keyring://` URIs, `env://` URIs, or `file://` URIs.
 /// Keyring account names are validated at load time by the keyring crate itself,
 /// but URI entries need structural validation upfront.
 fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
@@ -849,6 +858,10 @@ fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
         if nono::keystore::is_op_uri(key) {
             nono::keystore::validate_op_uri(key).map_err(|e| {
                 NonoError::ProfileParse(format!("invalid 1Password URI in env_credentials: {}", e))
+            })?;
+        } else if nono::keystore::is_bw_uri(key) {
+            nono::keystore::validate_bw_uri(key).map_err(|e| {
+                NonoError::ProfileParse(format!("invalid Bitwarden URI in env_credentials: {}", e))
             })?;
         } else if nono::keystore::is_apple_password_uri(key) {
             nono::keystore::validate_apple_password_uri(key).map_err(|e| {
@@ -1503,6 +1516,11 @@ pub struct Profile {
     /// Each entry is a `<namespace>/<name>` reference to an installed pack.
     #[serde(default)]
     pub packs: Vec<String>,
+    /// Binary path or command name to run when no trailing `-- <command>` is given.
+    /// Resolved via `PATH` lookup or canonicalized if absolute. Only honoured
+    /// for user-authored profiles (ignored for pack and built-in profiles).
+    #[serde(default)]
+    pub binary: Option<String>,
     /// Extra arguments appended to the child command at launch.
     /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
     #[serde(default)]
@@ -1571,6 +1589,8 @@ struct ProfileDeserialize {
     skipdirs: Vec<String>,
     #[serde(default)]
     packs: Vec<String>,
+    #[serde(default)]
+    binary: Option<String>,
     /// ALIAS(canonical="command_args", introduced="v0.0.0", remove_by="indefinite", issue="N/A")
     #[serde(default)]
     #[serde(alias = "brokered_commands")]
@@ -1607,6 +1627,7 @@ impl From<ProfileDeserialize> for Profile {
             interactive: raw.interactive,
             skipdirs: raw.skipdirs,
             packs: raw.packs,
+            binary: raw.binary,
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
         };
@@ -1661,7 +1682,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     let _suppress = crate::deprecation_warnings::WarningSuppressionGuard::begin();
 
     // Direct file path
-    if name_or_path.contains('/') || name_or_path.ends_with(".json") {
+    if is_file_path_ref(name_or_path) {
         return parse_profile_file(Path::new(name_or_path))
             .ok()
             .and_then(|p| p.extends);
@@ -1810,10 +1831,7 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
     if is_registry_ref(name_or_path) {
         return load_registry_profile(name_or_path).map(Some);
     }
-    if name_or_path.contains('/')
-        || name_or_path.ends_with(".json")
-        || name_or_path.ends_with(".jsonc")
-    {
+    if is_file_path_ref(name_or_path) {
         return load_profile_from_path(Path::new(name_or_path)).map(Some);
     }
     if !is_valid_profile_name(name_or_path) {
@@ -1999,6 +2017,13 @@ pub(crate) fn is_registry_ref(s: &str) -> bool {
         && !s.starts_with('/')
         && !s.ends_with(".json")
         && parts.iter().all(|p| !p.is_empty())
+}
+
+/// Returns true if the profile name looks like a direct filesystem path
+/// (contains path separators or has a recognized profile file extension)
+/// rather than a simple profile name or registry reference.
+pub(crate) fn is_file_path_ref(s: &str) -> bool {
+    !is_registry_ref(s) && (s.contains('/') || s.ends_with(".json") || s.ends_with(".jsonc"))
 }
 
 /// Load a profile from a registry pack. If the pack isn't installed locally,
@@ -2575,6 +2600,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
         packs: dedup_append(&base.packs, &child.packs),
+        binary: child.binary.or(base.binary),
         command_args: dedup_append(&base.command_args, &child.command_args),
         unsafe_macos_seatbelt_rules: dedup_append(
             &base.unsafe_macos_seatbelt_rules,
@@ -3385,6 +3411,34 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_env_credentials_accepts_bw_uri() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "bw://my-api-key": "MY_SECRET",
+                "bw://my-item/password": "MY_PASS"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert!(validate_env_credential_keys(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_credentials_rejects_invalid_bw_uri() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "bw://": "MY_SECRET"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let err = validate_env_credential_keys(&profile).expect_err("should reject");
+        assert!(err.to_string().contains("Bitwarden URI"));
+    }
+
+    #[test]
     fn test_validate_env_credentials_accepts_keyring_uri() {
         let json_str = r#"{
             "meta": { "name": "test-profile" },
@@ -4089,6 +4143,46 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_env_var_with_bw_uri_requires_env_var() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("bw://my-api-key".to_string());
+        cred.env_var = None;
+        let result = validate_custom_credential("openai", &cred);
+        let err = result.expect_err("bw:// URI without env_var should be rejected");
+        assert!(err.to_string().contains("env_var is required"));
+    }
+
+    #[test]
+    fn test_validate_env_var_with_bw_uri_and_env_var_ok() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("bw://my-api-key".to_string());
+        cred.env_var = Some("OPENAI_API_KEY".to_string());
+        assert!(validate_custom_credential("openai", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_var_with_bw_uri_field_and_env_var_ok() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("bw://my-item/password".to_string());
+        cred.env_var = Some("OPENAI_API_KEY".to_string());
+        assert!(validate_custom_credential("openai", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_credential_key_rejects_invalid_bw_uri() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("bw://".to_string());
+        cred.env_var = Some("MY_VAR".to_string());
+        let err = validate_custom_credential("openai", &cred)
+            .expect_err("empty bw:// item ID should be rejected");
+        assert!(
+            err.to_string().contains("Bitwarden URI"),
+            "expected Bitwarden-specific error, got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_validate_env_var_with_apple_password_uri_requires_env_var() {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("apple-password://github.com/alice@example.com".to_string());
@@ -4417,6 +4511,7 @@ mod tests {
             interactive: false,
             skipdirs: vec!["vendor".to_string()],
             packs: vec![],
+            binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
         }
@@ -4495,6 +4590,7 @@ mod tests {
             interactive: false,
             skipdirs: vec!["dist".to_string()],
             packs: vec![],
+            binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
         }
@@ -6432,6 +6528,44 @@ mod tests {
         assert!(
             resolved.extension().and_then(|e| e.to_str()) == Some("jsonc"),
             "should prefer .jsonc: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn profile_binary_field_parses_and_inherits() {
+        let base = br#"{
+            "meta": { "name": "base" },
+            "binary": "/usr/bin/base-agent"
+        }"#;
+        let base_profile = parse_profile_bytes(base).expect("parse base");
+        assert_eq!(base_profile.binary.as_deref(), Some("/usr/bin/base-agent"));
+
+        let child = br#"{
+            "meta": { "name": "child" },
+            "binary": "/opt/child-agent"
+        }"#;
+        let child_profile = parse_profile_bytes(child).expect("parse child");
+        assert_eq!(child_profile.binary.as_deref(), Some("/opt/child-agent"));
+
+        let merged = merge_profiles(base_profile, child_profile);
+        assert_eq!(
+            merged.binary.as_deref(),
+            Some("/opt/child-agent"),
+            "child binary should override base"
+        );
+
+        let no_binary = br#"{ "meta": { "name": "no-bin" } }"#;
+        let no_bin_profile = parse_profile_bytes(no_binary).expect("parse no-binary");
+        assert!(no_bin_profile.binary.is_none());
+
+        let base2 =
+            parse_profile_bytes(br#"{ "meta": { "name": "b2" }, "binary": "/usr/bin/inherited" }"#)
+                .expect("parse");
+        let merged2 = merge_profiles(base2, no_bin_profile);
+        assert_eq!(
+            merged2.binary.as_deref(),
+            Some("/usr/bin/inherited"),
+            "child without binary should inherit from base"
         );
     }
 }
