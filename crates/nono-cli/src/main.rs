@@ -22,6 +22,8 @@ mod deprecated_schema;
 mod deprecation_warnings;
 mod exec_strategy;
 mod execution_runtime;
+#[cfg(unix)]
+mod hook_runtime;
 mod instruction_deny;
 mod launch_runtime;
 mod learn;
@@ -255,6 +257,7 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: Some("developer".to_string()),
@@ -302,6 +305,7 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: Some("developer".to_string()),
@@ -424,6 +428,17 @@ mod tests {
         // thread would incur network I/O with no benefit.
         let completions = Cli::parse_from(["nono", "completion", "zsh"]);
         assert!(!allows_pre_exec_update_check(&completions.command));
+    }
+
+    #[test]
+    fn test_pre_exec_update_check_disabled_for_pack_update_hint_helper() {
+        let helper = Cli::parse_from([
+            "nono",
+            "pack-update-hint-helper",
+            "always-further/claude",
+            "1.0.0",
+        ]);
+        assert!(!allows_pre_exec_update_check(&helper.command));
     }
 
     #[test]
